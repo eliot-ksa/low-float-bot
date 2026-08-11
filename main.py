@@ -4,101 +4,109 @@ import time
 from datetime import datetime
 import pytz
 
-# ========= اعداداتك هنا =========
-TELEGRAM_TOKEN = os.getenv("8934617408:AAGU2IK8v7jMVxabU7mwFzLClxlENFBrbVA")
-CHAT_ID = os.getenv("7565323308")
-POLYGON_KEY = os.getenv("POLYGON_KEY", "") # اختياري، اذا ما عندك بيستخدم Finnhub المجاني
-FINNHUB_KEY = os.getenv("d9rh3opr01qkdnrf1augd9rh3opr01qkdnrf1av0")
+# ========== الاعدادات من Railway Variables ==========
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+POLYGON_KEY = os.getenv("POLYGON_KEY", "")
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
 
 MIN_PRICE = 0.10
 MAX_PRICE = 10.0
 
 def send_tg(msg):
     try:
+        if not TELEGRAM_TOKEN or not CHAT_ID:
+            print("Missing BOT_TOKEN or CHAT_ID")
+            return
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=15)
+        requests.post(url, json={
+            "chat_id": CHAT_ID, 
+            "text": msg, 
+            "parse_mode": "Markdown", 
+            "disable_web_page_preview": True
+        }, timeout=15)
+        print(f"Sent: {msg[:50]}")
     except Exception as e:
         print(f"TG Error {e}")
 
 def scan_dynamic():
-    """فحص ديناميكي - بدون اسهم ثابتة"""
+    alerts = []
     try:
-        # نستخدم Polygon للسكانر الديناميكي - يجيب كل السوق مرة وحدة
+        tickers_data = []
+        
+        # اذا عندك Polygon (الافضل)
         if POLYGON_KEY:
             url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_KEY}&limit=100"
             data = requests.get(url, timeout=15).json()
             tickers_data = data.get("tickers", [])
-        else:
-            # Fallback مجاني من Finnhub
-            url = f"https://finnhub.io/api/v1/scan/technical?token={FINNHUB_KEY}"
-            # Finnhub ما عنده gainers مجاني، نستخدم قائمة اكثر الاسهم تداولا كبديل مؤقت
-            # الحل الافضل تجيب مفتاح Polygon المجاني (يبدأ مجاني)
-            return []
-
-        alerts = []
-        for t in tickers_data:
-            day = t.get("day", {})
-            prev = t.get("prevDay", {})
-            price = day.get("c", 0)
-            prev_close = prev.get("c", 0)
-            if prev_close == 0: continue
-
-            # شرط 1: سعرك
-            if not (MIN_PRICE <= price <= MAX_PRICE):
-                continue
-
-            gap = ((price - prev_close) / prev_close) * 100
-            volume = day.get("v", 0)
             
-            # شرط 2 و 3: Gap + Volume
-            if gap < 10 or volume < 200000:
-                continue
+            for t in tickers_data:
+                day = t.get("day", {})
+                prev = t.get("prevDay", {})
+                price = day.get("c", 0)
+                prev_close = prev.get("c", 0)
+                if prev_close == 0:
+                    continue
+                if not (MIN_PRICE <= price <= MAX_PRICE):
+                    continue
+                
+                change_percent = ((price - prev_close) / prev_close) * 100
+                if change_percent >= 10:  # صاعد 10%+
+                    symbol = t.get("ticker", "")
+                    alerts.append(f"🚀 *{symbol}* ${price:.2f} (+{change_percent:.1f}%) | Vol: {day.get('v',0):,}")
+        
+        else:
+            # استخدام Finnhub المجاني - نفحص قائمة اسهم اللو فلوت المشهورة
+            # Finnhub ما يعطي gainers مجاني، فنستخدم طريقة ثانية
+            # نفحص اكثر الاسهم تداولاً اليوم
+            print("Using Finnhub fallback...")
+            # تقدر تضيف هنا لستة اسهمك المفضلة للفحص
+            test_symbols = ["FFIE", "GME", "AMC", "BBBY", "MULN", "NVAX"]
+            for symbol in test_symbols:
+                try:
+                    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+                    r = requests.get(url, timeout=10).json()
+                    price = r.get("c", 0)
+                    prev_close = r.get("pc", 0)
+                    if prev_close == 0 or price == 0:
+                        continue
+                    if not (MIN_PRICE <= price <= MAX_PRICE):
+                        continue
+                    change = ((price - prev_close) / prev_close) * 100
+                    if change >= 5:
+                        alerts.append(f"🚀 *{symbol}* ${price:.2f} (+{change:.1f}%)")
+                except:
+                    continue
+                time.sleep(0.5)  # عشان لا نتجاوز الحد المجاني
 
-            # شرط 4: مقاومة 5 ايام - نفس دوائرك $4.7 و $2.53
-            ticker = t["ticker"]
-            try:
-                agg_url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/2026-08-01/2026-08-11?apiKey={POLYGON_KEY}"
-                agg = requests.get(agg_url, timeout=10).json()
-                if agg.get("results"):
-                    resistance = max([x["h"] for x in agg["results"][-5:]])
-                    # اذا قريب من المقاومة او اخترقها
-                    if price >= resistance * 0.96:
-                        emoji = "🚀" if price > resistance else "👀"
-                        alerts.append(f"{emoji} *{ticker}* ${price:.2f} | Gap %{gap:.1f} | Vol {volume:,}\n   مقاومة 5 ايام: ${resistance:.2f} -> {'اختراق' if price>resistance else 'عند المقاومة'}")
-            except:
-                continue
-
-        return alerts
     except Exception as e:
-        print(f"Scan error: {e}")
-        return []
-
-def main():
-    send_tg(f"✅ *بوت الاختراقات اشتغل*\n💰 الفلتر: ${MIN_PRICE} - ${MAX_PRICE}\n⏰ كل 5 دقايق\n🔍 ديناميكي - بدون اسهم ثابتة\nالنمط: اختراق مقاومة مثل XHLD $4.7 / SCKT $0.75")
+        print(f"Scan Error {e}")
     
+    return alerts
+
+# ========== التشغيل الرئيسي ==========
+if __name__ == "__main__":
+    print("Bot Started...")
+    send_tg("🚀 البوت اشتغل بنجاح على Railway ✅\nالفحص الديناميكي بدأ...")
+
     while True:
         try:
-            ny = datetime.now(pytz.timezone('America/New_York'))
-            ksa = datetime.now(pytz.timezone('Asia/Riyadh'))
-            is_market_time = (7 <= ny.hour <= 16) # 7 صباحا الى 4 مساء نيويورك = 2 الظهر الى 11 ليلا الرياض
-
-            if is_market_time:
+            # مواقيت السوق الامريكي 9:30 ص - 4:00 م بتوقيت نيويورك
+            ny_tz = pytz.timezone('America/New_York')
+            now_ny = datetime.now(ny_tz)
+            
+            # فحص فقط وقت السوق (الاثنين للجمعة)
+            if now_ny.weekday() < 5:  # 0-4 = Mon-Fri
                 alerts = scan_dynamic()
-                if alerts:
-                    header = f"📈 *تنبيهات {ksa.strftime('%I:%M %p')} بتوقيت الرياض*\nالسوق: {'مفتوح' if 9 <= ny.hour < 16 else 'بريماركت'}\n\n"
-                    msg = header + "\n\n".join(alerts[:8])
-                    send_tg(msg)
-                else:
-                    # لا يرسل اذا ما فيه شي عشان لا يزعجك - تقدر تفعلها
-                    print(f"{ksa.strftime('%H:%M')} - فحص: لا يوجد سهم مطابق للشروط")
-
+                for alert in alerts:
+                    send_tg(alert)
+                    time.sleep(2)
             else:
-                print(f"خارج وقت السوق - نايم - {ksa}")
+                print(f"Weekend - {now_ny}")
 
-            time.sleep(300) # كل 5 دقايق بالضبط
+            # انتظر 5 دقايق بين كل فحص
+            time.sleep(300)
+
         except Exception as e:
-            print(f"Loop error {e}")
+            print(f"Main Loop Error {e}")
             time.sleep(60)
-
-if __name__ == "__main__":
-    main()
