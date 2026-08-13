@@ -1,106 +1,139 @@
 import os, time, requests, pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 POLYGON_KEY = os.getenv("POLYGON_KEY")
-FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
-sent_today = set() # عشان ما يكرر نفس السهم
+sent_premarket = set()
+sent_rocket = set()
 
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
-        print(f"Sent: {msg[:100]}")
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=15)
+        print(f"Sent: {msg[:80]}")
     except Exception as e:
         print(f"Send Error: {e}")
 
 def is_allowed():
     tz = pytz.timezone('Asia/Riyadh')
     h = datetime.now(tz).hour
-    return not (3 <= h < 11) # شغال من 11ص لـ 3ص
+    return not (3 <= h < 11) # شغال 11ص لـ 3ص
 
-def get_float_and_news(symbol):
-    try:
-        # جيب خبر من Finnhub
-        url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from=2026-08-11&to=2026-08-13&token={FINNHUB_KEY}"
-        news = requests.get(url, timeout=10).json()
-        has_news = "✅" if len(news) > 0 else "❌"
-        news_headline = news[0]['headline'][:80] if len(news) > 0 else "لا يوجد خبر"
-    except:
-        has_news = "❓"
-        news_headline = "خطأ في الاخبار"
-
-    # Polygon Float (تقريبي)
+def get_float(symbol):
     try:
         url = f"https://api.polygon.io/v3/reference/tickers/{symbol}?apiKey={POLYGON_KEY}"
-        data = requests.get(url, timeout=10).json()
-        float_shares = data.get('results', {}).get('share_class_shares_outstanding', 0)
-        if float_shares == 0:
-            float_text = "غير معروف"
-        else:
-            float_text = f"{float_shares/1000000:.1f}M"
-            if float_shares < 10000000:
-                float_text += " 🔥 LOW FLOAT"
+        r = requests.get(url, timeout=10).json()
+        shares = r.get('results', {}).get('share_class_shares_outstanding')
+        if not shares: return 999999999, "غير معروف"
+        float_m = shares / 1000000
+        txt = f"{float_m:.1f}M"
+        if float_m < 5: txt += " 🔥🔥"
+        elif float_m < 10: txt += " 🔥"
+        return shares, txt
     except:
-        float_text = "غير معروف"
+        return 999999999, "غير معروف"
 
-    return float_text, has_news, news_headline
-
-def scan_premarket():
+def get_vwap_check(symbol):
     try:
-        # سكنر Gainers + Most Active
-        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_KEY}"
-        gainers = requests.get(url, timeout=15).json().get('tickers', [])[:15]
+        # نجيب اخر 30 دقيقة
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{from_date}/{to_date}?adjusted=true&sort=desc&limit=50&apiKey={POLYGON_KEY}"
+        r = requests.get(url, timeout=10).json()
+        bars = r.get('results', [])
+        if len(bars) < 10: return 0, "لا يوجد"
 
-        hot = []
+        # حساب VWAP
+        pv = sum(b['c'] * b['v'] for b in bars)
+        vv = sum(b['v'] for b in bars)
+        vwap = pv / vv if vv else 0
+        last = bars[0]['c']
+
+        diff = ((last - vwap) / vwap * 100) if vwap else 0
+
+        if -3 <= diff <= 3:
+            status = f"✅ عند VWAP ({diff:+.1f}%) - دخول محتمل"
+        elif diff > 8:
+            status = f"⚠️ بعيد فوق VWAP ({diff:+.1f}%) - خطر قمة"
+        elif diff < -5:
+            status = f"📉 تحت VWAP ({diff:+.1f}%) - انتظر ارتداد"
+        else:
+            status = f"قريب من VWAP ({diff:+.1f}%)"
+
+        return vwap, status
+    except Exception as e:
+        return 0, f"خطأ VWAP {e}"
+
+def scan():
+    alerts = []
+    try:
+        tz = pytz.timezone('Asia/Riyadh')
+        now = datetime.now(tz)
+        is_premarket = 11 <= now.hour < 16 or (now.hour == 16 and now.minute < 30)
+
+        # جيب Gainers
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_KEY}"
+        gainers = requests.get(url, timeout=15).json().get('tickers', [])[:25]
+
         for t in gainers:
             sym = t.get('ticker')
-            if sym in sent_today: continue
+            if not sym or len(sym) > 5: continue
 
             price = t.get('day', {}).get('c', 0)
             vol = t.get('day', {}).get('v', 0)
             change = t.get('todaysChangePerc', 0)
 
-            # شروط البري ماركت الذهبية
-            if 1.5 < price < 10 and vol > 200000 and change > 10:
-                float_text, has_news, headline = get_float_and_news(sym)
+            # الشرط الاساسي
+            if not (1.5 < price < 8 and vol > 200000): continue
 
-                # اذا Float قليل او فيه خبر نرسله
-                if "LOW FLOAT" in float_text or "✅" in has_news or vol > 500000:
-                    msg = f"🚨 *سهم ساخن قبل الافتتاح* 🚨\n\n*{sym}* - ${price:.2f} ({change:.1f}%)\nVol: {vol/1000:.0f}K\nFloat: {float_text}\nخبر: {has_news} {headline}\n\n[شارت](https://finance.yahoo.com/quote/{sym})"
-                    hot.append(msg)
-                    sent_today.add(sym)
-                    time.sleep(2) # عشان لا يعلق Finnhub
-        return hot
+            float_shares, float_txt = get_float(sym)
+
+            # --- حركة المحترفين ---
+            # 1- بري ماركت: 10%+ مع Float < 10M
+            if is_premarket and change >= 10 and float_shares < 10000000 and sym not in sent_premarket:
+                vwap, vwap_status = get_vwap_check(sym)
+                msg = f"🚨 *بري ماركت ساخن (مرشح 50%)* 🚨\n\n*{sym}* - ${price:.2f} ({change:.1f}%)\nVol: {vol/1000:.0f}K\nFloat: {float_txt}\n{vwap_status}\n\n*خطة المحترف:* انتظر يلمس VWAP ويرتد بفوليوم\n[Chart](https://finance.yahoo.com/quote/{sym})"
+                alerts.append(msg)
+                sent_premarket.add(sym)
+                time.sleep(1)
+
+            # 2- بعد الافتتاح: اذا صار 30%+ ننبه انه يقترب من 50%
+            elif not is_premarket and change >= 30 and sym not in sent_rocket:
+                vwap, vwap_status = get_vwap_check(sym)
+                if float_shares < 10000000: # فقط Low Float
+                    msg = f"🚀 *يقترب من 50%* 🚀\n\n*{sym}* - ${price:.2f} ({change:.1f}%)\nVol: {vol/1000000:.1f}M\nFloat: {float_txt}\n{vwap_status}\n\n*انتبه:* اذا فوق VWAP بكثير لا تلحق قمة\n[Chart](https://finance.yahoo.com/quote/{sym})"
+                    alerts.append(msg)
+                    sent_rocket.add(sym)
+                    time.sleep(1)
+
     except Exception as e:
         print(f"Scan Error: {e}")
-        return []
+    return alerts
 
-send("🔥 البوت الاحترافي اشتغل\nبري ماركت سكنر من 11ص بتوقيت الرياض\nFloat + اخبار + Volume ✅")
-print("Bot Pro Started...")
+send("🔥 *بوت المحترفين V3 اشتغل*\n11ص-4م: يصيد 10%+ Float<10M\n4:30م-3ص: ينبه اذا وصل 30%+ (مرشح 50%)\nمع فحص VWAP ✅")
+print("Pro V3 Started")
 
 while True:
     try:
         if not is_allowed():
-            sent_today.clear() # نفضي القائمة كل يوم جديد
+            # تصفير كل يوم جديد الساعة 3 الفجر
+            if datetime.now(pytz.timezone('Asia/Riyadh')).hour == 3:
+                sent_premarket.clear()
+                sent_rocket.clear()
             print("⏸️ نايم")
             time.sleep(60)
             continue
 
-        now = datetime.now(pytz.timezone('Asia/Riyadh'))
-        print(f"🔍 [{now.strftime('%H:%M:%S')}] فحص بري ماركت...")
-
-        stocks = scan_premarket()
-        for s in stocks:
-            send(s)
-
-        if not stocks:
-            print("No hot stocks")
-
-        time.sleep(60) # كل دقيقة
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] فحص محترفين...")
+        msgs = scan()
+        for m in msgs:
+            send(m)
+        if not msgs:
+            print("No pro candidates")
+        time.sleep(60)
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         time.sleep(15)
