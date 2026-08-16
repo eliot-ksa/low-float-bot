@@ -6,7 +6,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 POLYGON_KEY = os.getenv("POLYGON_KEY")
 
 playbook = {}
-entries = {} # sym -> entry price
+entries = {}
 sent = set()
 candidates = []
 playbook_date = ""
@@ -15,7 +15,8 @@ def send(m):
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": m, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=15)
-    except: pass
+    except Exception as e:
+        print(e)
 
 def get_float(sym):
     try:
@@ -31,44 +32,49 @@ def has_news(sym):
 
 def get_indicators(sym):
     try:
-        # اخر 50 شمعة دقيقة
         today = datetime.now().strftime('%Y-%m-%d')
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        yesterday = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
         url = f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/{yesterday}/{today}?adjusted=true&sort=desc&limit=100&apiKey={POLYGON_KEY}"
         bars = requests.get(url, timeout=15).json().get('results', [])
         if len(bars) < 20: return None
 
-        # VWAP
-        pv = sum(b['c']*b['v'] for b in bars[:50])
-        vv = sum(b['v'] for b in bars[:50])
-        vwap = pv/vv if vv else bars[0]['c']
+        bars = list(reversed(bars)) # نخليها من القديم للجديد عشان RSI
+        last_50 = bars[-50:]
 
-        # HOD / LOD
-        hod = max(b['h'] for b in bars[:50])
-        lod = min(b['l'] for b in bars[:50])
+        pv = sum(b['c']*b['v'] for b in last_50)
+        vv = sum(b['v'] for b in last_50)
+        vwap = pv/vv if vv else last_50[-1]['c']
 
-        # RSI مبسط 14
-        closes = [b['c'] for b in bars[:15]][::-1]
-        gains = sum(max(0, closes[i]-closes[i-1]) for i in range(1,len(closes)))
-        losses = sum(max(0, closes[i-1]-closes[i]) for i in range(1,len(closes)))
-        rs = gains/(losses or 0.001)
+        hod = max(b['h'] for b in last_50)
+        lod = min(b['l'] for b in last_50)
+
+        # RSI صحيح
+        closes = [b['c'] for b in bars[-15:]]
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i-1]
+            gains.append(max(0, diff))
+            losses.append(max(0, -diff))
+        avg_gain = sum(gains)/14 if gains else 0
+        avg_loss = sum(losses)/14 if losses else 0.001
+        rs = avg_gain/(avg_loss or 0.001)
         rsi = 100 - (100/(1+rs))
 
-        # Volume
-        last_vol = bars[0]['v']
-        avg_vol = sum(b['v'] for b in bars[1:21])/20
+        last = bars[-1]
+        avg_vol = sum(b['v'] for b in bars[-21:-1])/20 if len(bars)>21 else last['v']
 
         return {
-            'price': bars[0]['c'],
+            'price': last['c'],
             'vwap': vwap,
             'hod': hod,
             'lod': lod,
             'rsi': rsi,
-            'last_vol': last_vol,
+            'last_vol': last['v'],
             'avg_vol': avg_vol or 1,
-            'prev_close': bars[1]['c']
         }
-    except: return None
+    except Exception as e:
+        print(f"ind {sym} {e}")
+        return None
 
 def get_gainers():
     try:
@@ -76,7 +82,7 @@ def get_gainers():
         return requests.get(url, timeout=15).json().get('tickers', [])
     except: return []
 
-send("✅ *V9 اشتغل - 11ص الى 3 الفجر*\nتحديث كل 5 دقايق\nفلتر: 1.5-10$ + Float<10M + خبر\nدخول: كسر قمة + VWAP + RSI\nخروج: 25%/50% + وقف 5%")
+send("✅ *V9.1 مصحح اشتغل - 11ص الى 3 الفجر*")
 
 while True:
     try:
@@ -85,13 +91,12 @@ while True:
         hour = now.hour
         today_str = str(now.date())
 
-        # الوقت: 11ص الى 3 الفجر (11-23 و 0-3)
         active_time = (11 <= hour <= 23) or (0 <= hour < 3)
         if not active_time:
             time.sleep(60)
             continue
 
-        # 1. تجميع 11ص - 4:30م
+        # 1. تجميع
         if 11 <= hour < 16 or (hour==16 and now.minute < 30):
             for t in get_gainers()[:40]:
                 sym = t.get('ticker','')
@@ -99,91 +104,76 @@ while True:
                 price = t.get('day',{}).get('c',0)
                 change = t.get('todaysChangePerc',0)
                 if not (1.5 <= price <= 10 and 10 <= change <= 120): continue
-
                 f = get_float(sym)
                 if f!=0 and f > 10000000: continue
                 if not has_news(sym): continue
-
-                candidates.append({'sym': sym, 'price': price, 'change': change})
-                send(f"🔍 مرشح: *{sym}* ${price:.2f} +{change:.1f}% Float {f/1000000:.1f}M" if f else f"🔍 مرشح: *{sym}* ${price:.2f} +{change:.1f}%")
+                candidates.append({'sym': sym, 'price': price, 'change': change, 'float': f})
+                send(f"🔍 مرشح: *{sym}* ${price:.2f} +{change:.1f}%")
                 time.sleep(1)
 
-        # 2. بناء PlayBook 4:30م
-        if hour==16 and now.minute>=30 and now.minute<35 and playbook_date!= today_str:
+        # 2. PlayBook 4:30
+        if hour==16 and 30 <= now.minute < 35 and playbook_date!= today_str:
+            # تصفير sent حق امس
+            sent.clear()
+            entries.clear()
             if candidates:
                 top = sorted(candidates, key=lambda x: x['change'], reverse=True)[:3]
                 playbook = {c['sym']: c for c in top}
-                msg = f"📘 *PlayBook {now.strftime('%m/%d')} - 11ص الى 3 الفجر*\n\n"
+                msg = f"📘 *PlayBook {now.strftime('%m/%d')}*\n\n"
                 for i,c in enumerate(top,1):
                     msg+=f"{i}. *{c['sym']}* ${c['price']:.2f} +{c['change']:.1f}%\n"
-                msg+="\n⏰ المراقبة كل 5 دقايق الى 3 الفجر\nدخول بعد 4:35م فقط"
+                msg+="\n⏰ مراقبة كل 5 دقايق الى 3 الفجر"
                 send(msg)
-                playbook_date = today_str
             else:
-                send("📭 اليوم ما فيه اسهم مطابقة - نكمل مراقبة الى 3 الفجر")
-                playbook_date = today_str
+                send("📭 اليوم لا يوجد")
+            playbook_date = today_str
 
-        # 3. مراقبة ودخول/خروج كل 5 دقايق (4:35م - 3 الفجر)
+        # 3. مراقبة
         if playbook and (hour>16 or (hour==16 and now.minute>=35) or hour<3 or hour>=17):
             for sym in list(playbook.keys()):
                 ind = get_indicators(sym)
                 if not ind: continue
                 price = ind['price']
 
-                # --- دخول ---
                 if sym not in entries:
-                    # شرط 1: كسر قمة بفوليوم + RSI <70
-                    cond_break = price > ind['hod']*1.002 and ind['last_vol'] > ind['avg_vol']*1.8 and ind['rsi'] < 72
-                    # شرط 2: ارتداد VWAP + RSI 40-60
-                    near_vwap = abs(price - ind['vwap'])/ind['vwap']*100 < 1.2
-                    cond_vwap = near_vwap and price > ind['prev_close'] and 40 < ind['rsi'] < 65 and ind['last_vol'] > ind['avg_vol']*1.3
+                    cond_break = price > ind['hod']*1.003 and ind['last_vol'] > ind['avg_vol']*1.8 and ind['rsi'] < 75
+                    near_vwap = abs(price - ind['vwap'])/ind['vwap']*100 < 1.5
+                    cond_vwap = near_vwap and price > ind['vwap'] and 45 < ind['rsi'] < 68
 
                     if cond_break and f"break_{sym}" not in sent:
                         entries[sym] = price
-                        send(f"🚀 *دخول كسر قمة {sym}*\nسعر ${price:.2f} | قمة ${ind['hod']:.2f}\nRSI {ind['rsi']:.0f} | Vol {ind['last_vol']/ind['avg_vol']:.1f}x\nVWAP ${ind['vwap']:.2f}\nوقف: ${ind['lod']:.2f} (-5%)\n[📈 شارت](https://www.tradingview.com/chart/?symbol={sym})")
+                        send(f"🚀 *كسر قمة {sym}* ${price:.2f}\nقمة ${ind['hod']:.2f} | RSI {ind['rsi']:.0f}\nوقف: ${price*0.95:.2f} (-5%)")
                         sent.add(f"break_{sym}")
-
                     elif cond_vwap and f"vwap_{sym}" not in sent:
                         entries[sym] = price
-                        send(f"🟢 *دخول ارتداد VWAP {sym}*\nسعر ${price:.2f} | VWAP ${ind['vwap']:.2f}\nRSI {ind['rsi']:.0f} | Vol {ind['last_vol']/ind['avg_vol']:.1f}x\nوقف تحت VWAP 2%\n[📈 شارت](https://www.tradingview.com/chart/?symbol={sym})")
+                        send(f"🟢 *VWAP {sym}* ${price:.2f} | VWAP ${ind['vwap']:.2f}\nRSI {ind['rsi']:.0f}")
                         sent.add(f"vwap_{sym}")
-
-                # --- خروج ---
                 else:
                     entry = entries[sym]
                     profit = (price-entry)/entry*100
-
-                    # هدف 1: 25%
                     if profit >= 25 and f"half_{sym}" not in sent:
-                        send(f"💰 *بيع نصف {sym} +{profit:.1f}%*\nدخول ${entry:.2f} -> ${price:.2f}\nحرك الوقف على الدخول")
+                        send(f"💰 *نصف {sym} +{profit:.1f}%* دخول ${entry:.2f} -> ${price:.2f}")
                         sent.add(f"half_{sym}")
-
-                    # هدف 2: 50%
                     if profit >= 50 and f"full_{sym}" not in sent:
-                        send(f"🔥 *بيع 75% {sym} +{profit:.1f}%*\nخل ربع اخير مجاني")
+                        send(f"🔥 *75% {sym} +{profit:.1f}%*")
                         sent.add(f"full_{sym}")
-
-                    # وقف خسارة 5% او كسر VWAP ب 3%
-                    if profit <= -5 or price < ind['vwap']*0.97:
+                    if profit <= -5:
                         if f"stop_{sym}" not in sent:
-                            send(f"⛔ *وقف {sym} {profit:.1f}%*\nسعر ${price:.2f} | VWAP ${ind['vwap']:.2f}\nRSI {ind['rsi']:.0f}")
+                            send(f"⛔ *وقف {sym} {profit:.1f}%*")
                             sent.add(f"stop_{sym}")
-                            del entries[sym] # اطلع من السهم
-
-                    # تنبيه RSI عالي جدا (تشبع)
-                    if ind['rsi'] > 82 and f"rsi_{sym}" not in sent:
-                        send(f"⚠️ *{sym} تشبع RSI {ind['rsi']:.0f}* - فكر تبيع")
+                            del entries[sym]
+                    if ind['rsi'] > 83 and f"rsi_{sym}" not in sent:
+                        send(f"⚠️ *{sym} RSI {ind['rsi']:.0f} متشبع*")
                         sent.add(f"rsi_{sym}")
 
-        # تصفير يوم جديد 3:05 الفجر
-        if hour==3 and now.minute>=5 and now.minute<10:
+        if hour==3 and 5 <= now.minute < 10:
             candidates.clear()
             playbook.clear()
             entries.clear()
             sent.clear()
-            send("🌙 انتهت جلسة اليوم - تصفير للبكرة 11ص")
+            playbook_date = ""
+            send("🌙 تصفير - نبدأ 11ص")
 
-        # تحديث كل 5 دقايق
         time.sleep(300)
 
     except Exception as e:
