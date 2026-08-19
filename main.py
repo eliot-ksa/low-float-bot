@@ -1,20 +1,21 @@
 import os, time, requests, schedule, pytz
 from datetime import datetime, timedelta
 
+# اساميك انتي اللي في الصورة
 POLYGON_KEY = os.getenv("POLYGON_KEY", "")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT", "")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN", "")
+TELEGRAM_CHAT = os.getenv("CHAT_ID", "")
 
 KSA = pytz.timezone('Asia/Riyadh')
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        print(f"No telegram keys: {msg[:50]}")
+        print(f"No telegram keys")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=15)
-        print("Telegram sent")
+        print("Telegram sent ✅")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -59,8 +60,7 @@ def get_details(sym):
             'high_90': high_90, 'low_90': low_90, 'box_range': box_range,
             'vwap': vwap
         }
-    except Exception as e:
-        print(f"Details error {sym}: {e}")
+    except:
         return None
 
 def scan():
@@ -89,7 +89,6 @@ def job():
     try:
         now_ksa = datetime.now(KSA)
         hour = now_ksa.hour
-        # ينام من 3 الفجر الى 11 الصبح بتوقيت السعودية
         if 3 <= hour < 11:
             print(f"{now_ksa.strftime('%H:%M')} KSA - نايم")
             return
@@ -101,7 +100,6 @@ def job():
         for p in picks:
             msg = f"""
 🚀 *V11 PICK - {p['sym']}*
-
 💰 ${p['price']:.2f} | 📈 +{p['change']:.1f}%
 🔥 RelVol: {p['rel_vol']:.1f}x | 📦 {p['vol']/1_000_000:.1f}M
 🎯 بوكس: {p['low_90']:.2f} - {p['high_90']:.2f}$
@@ -114,9 +112,8 @@ def job():
     except Exception as e:
         print(f"Job error: {e}")
 
-# بداية
 print("V11 Bot Starting...")
-send_telegram(f"✅ *V11 اشتغل*\n⏰ من 11 الصبح الى 3 الفجر KSA\n📅 {datetime.now(KSA).strftime('%Y-%m-%d %H:%M')}")
+send_telegram(f"✅ *V11 اشتغل*\n⏰ من 11 الصبح الى 3 الفجر KSA\n📅 {datetime.now(KSA).strftime('%H:%M')} KSA")
 
 schedule.every(5).minutes.do(job)
 job()
