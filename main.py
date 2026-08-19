@@ -1,43 +1,45 @@
-import requests, time, schedule, os
-from datetime import datetime, timedelta
+import os, time
+print("Starting bot... checking libs")
 
-POLYGON_KEY = os.getenv("POLYGON_KEY", "ضع_مفتاحك_هنا")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ضع_التوكن_هنا")
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT", "ضع_الايدي_هنا")
+# يجرب يستورد، لو فشل يثبت
+try:
+    import requests, schedule
+except:
+    print("Installing libs...")
+    os.system("pip install requests schedule")
+    import requests, schedule
 
-def send_telegram(msg):
+from datetime import datetime
+
+TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT = os.getenv("TELEGRAM_CHAT", "")
+POLY = os.getenv("POLYGON_KEY", "")
+
+print(f"TOKEN exists: {bool(TOKEN)}")
+print(f"CHAT exists: {bool(CHAT)}")
+
+def send(msg):
+    if not TOKEN or not CHAT:
+        print(f"Would send: {msg}")
+        return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": CHAT, "text": msg}, timeout=10)
+        print("Sent to Telegram")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Send failed: {e}")
 
-def job():
+send("✅ البوت اشتغل على Koyeb - من 11 الصبح الى 3 الفجر")
+
+# حلقة ما تكرش
+while True:
     try:
         now = datetime.now()
         hour = now.hour
         if 3 <= hour < 11:
-            print(f"{now.strftime('%H:%M')} - نايم")
-            return
-        print(f"{now.strftime('%H:%M')} - يفحص...")
-        # هنا تحطين دالة scan حقتك
-        # مؤقتا نرسل رسالة تجربة
-        # send_telegram(f"فحص {now.strftime('%H:%M')} KSA")
+            print(f"{now.strftime('%H:%M')} sleeping")
+        else:
+            print(f"{now.strftime('%H:%M')} awake - would scan here")
+        time.sleep(60)
     except Exception as e:
-        print(f"Error in job: {e}")
-        time.sleep(5) # لا يكرش
-
-# تشغيل
-print("Bot started!")
-send_telegram("✅ V11 اشتغل - من 11 الصبح الى 3 الفجر KSA")
-
-schedule.every(5).minutes.do(job)
-job()
-
-while True:
-    try:
-        schedule.run_pending()
-        time.sleep(30)
-    except Exception as e:
-        print(f"Loop error: {e}")
-        time.sleep(30)
+        print(f"Error: {e}")
+        time.sleep(60)
