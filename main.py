@@ -1,7 +1,7 @@
 import os, time, requests, schedule, pytz
 from datetime import datetime, timedelta
 
-# نفس المفاتيح اللي عندك في الصورة
+# نفس المفاتيح اللي عندك
 POLYGON_KEY = os.getenv("POLYGON_KEY", "")
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN", "")
 TELEGRAM_CHAT = os.getenv("CHAT_ID", "")
@@ -10,6 +10,14 @@ FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
 KSA = pytz.timezone('Asia/Riyadh')
 ET = pytz.timezone('America/New_York')
 WATCHLIST_FILE = "/tmp/watchlist.txt"
+
+# كلمات تدمر السهم - تجاهل فوري
+BLACKLIST_WORDS = [
+    "offering", "public offering", "registered direct",
+    "bankruptcy", "chapter 11", "going concern",
+    "reverse split", "dilution", "warrant",
+    "at the market", "atm offering", "shelf offering"
+]
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -23,7 +31,6 @@ def send_telegram(msg):
         print(f"Telegram error: {e}")
 
 def get_gainers():
-    """يجيب أسهم الفجوة قبل الافتتاح"""
     try:
         url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_KEY}"
         r = requests.get(url, timeout=15).json()
@@ -32,30 +39,19 @@ def get_gainers():
         for t in tickers:
             ticker = t.get('ticker')
             prev = t.get('prevDay', {})
-            # تفاصيل أكثر لكل سهم
             snap_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={POLYGON_KEY}"
             s = requests.get(snap_url, timeout=10).json().get('ticker', {})
             pre = s.get('preMarket', {})
             pre_price = pre.get('p') or s.get('day',{}).get('c') or t.get('day',{}).get('c')
             pre_vol = pre.get('v', 0) or s.get('day',{}).get('v', 0)
             prev_close = prev.get('c')
-            if not prev_close or not pre_price:
-                continue
+            if not prev_close or not pre_price: continue
             gap = ((pre_price - prev_close) / prev_close) * 100
             price = pre_price
-
-            # الفلتر الأساسي اللي اتفقنا عليه
             if not (1.5 <= price <= 25): continue
             if gap < 4: continue
             if pre_vol < 150000: continue
-
-            results.append({
-                "ticker": ticker,
-                "price": round(price,2),
-                "gap": round(gap,2),
-                "pre_vol": int(pre_vol),
-                "prev_close": prev_close
-            })
+            results.append({"ticker": ticker, "price": round(price,2), "gap": round(gap,2), "pre_vol": int(pre_vol), "prev_close": prev_close})
         return sorted(results, key=lambda x: x['gap'], reverse=True)
     except Exception as e:
         print(f"get_gainers error: {e}")
@@ -64,21 +60,26 @@ def get_gainers():
 def get_float_and_news(ticker):
     float_m = None
     catalyst = "No recent catalyst"
-    # Float من Finnhub
-    if FINNHUB_KEY:
-        try:
+    try:
+        if FINNHUB_KEY:
             url = f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={FINNHUB_KEY}"
             p = requests.get(url, timeout=10).json()
             float_m = p.get('shareOutstanding')
-        except: pass
-    # خبر من Polygon
+    except: pass
+
     try:
-        url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=1&apiKey={POLYGON_KEY}"
+        url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&limit=3&apiKey={POLYGON_KEY}"
         data = requests.get(url, timeout=10).json().get('results', [])
         if data:
+            for news in data:
+                title = news.get('title','').lower()
+                for bad in BLACKLIST_WORDS:
+                    if bad in title:
+                        print(f"Skipping {ticker} - bad news: {title}")
+                        return None, None, True
             catalyst = data[0].get('title','')[:130]
     except: pass
-    return float_m, catalyst
+    return float_m, catalyst, False
 
 def phase1_scan():
     now = datetime.now(KSA)
@@ -86,21 +87,20 @@ def phase1_scan():
     gappers = get_gainers()
     final = []
     for g in gappers[:12]:
-        fm, cat = get_float_and_news(g['ticker'])
-        # فلتر Float < 20M - أهم فلتر للانفجارات
-        if fm and fm > 20:
-            continue
+        fm, cat, is_bad = get_float_and_news(g['ticker'])
+        if is_bad: continue
+        if fm is None and cat is None: continue
+        if fm and fm > 20: continue
         g['float_m'] = fm
         g['catalyst'] = cat
         final.append(g)
         time.sleep(0.7)
 
     if not final:
-        send_telegram("😴 لا يوجد سهم مطابق للفلتر حالياً")
+        send_telegram("😴 لا يوجد سهم مطابق للفلتر (أو كلها فيها Offering)")
         return []
 
     final = final[:3]
-    # حفظ القائمة للمرحلة الثانية
     with open(WATCHLIST_FILE, 'w') as f:
         f.write(",".join([x['ticker'] for x in final]))
 
@@ -117,7 +117,6 @@ def phase1_scan():
     return final
 
 def get_vwap_cross(ticker):
-    """يحسب VWAP من شموع الدقيقة ويكشف كسره"""
     try:
         today = datetime.now(ET).strftime('%Y-%m-%d')
         url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{today}/{today}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}"
@@ -147,7 +146,6 @@ def phase2_monitor():
     except:
         tickers = [x['ticker'] for x in phase1_scan()]
     if not tickers: return
-
     send_telegram(f"👀 *بدأت مراقبة VWAP* : {', '.join(['$'+t for t in tickers])}\nتنبيه عند كسر VWAP +0.5%")
     alerted = set()
     end = datetime.now(KSA) + timedelta(hours=2)
@@ -163,7 +161,6 @@ def phase2_monitor():
         time.sleep(60)
     send_telegram("✅ انتهت مراقبة اليوم")
 
-# التشغيل التلقائي
 if __name__ == "__main__":
     import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
