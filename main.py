@@ -1,103 +1,130 @@
-//@version=5
-indicator("Breakout Signals (Donchian + 200 EMA + Volume + ATR) Easier_stock", overlay=true, max_labels_count=500)
+import os, time, requests, schedule, pytz, threading
+from datetime import datetime, timedelta
 
-// ─────────────────────────────────────────────────────────────
-// Signal toggles
-enableBuy  = input.bool(true,  "Enable BUY Signals")
-enableSell = input.bool(true,  "Enable SELL Signals")
+POLYGON_KEY = os.getenv("POLYGON_KEY", "")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN", "")
+TELEGRAM_CHAT = os.getenv("CHAT_ID", "")
+KSA = pytz.timezone('Asia/Riyadh')
 
-// ─────────────────────────────────────────────────────────────
-// Breakout settings
-len            = input.int(20,  "Donchian Lookback", minval=2)
-useCloseLevels = input.bool(false, "Use Close for Levels (vs High/Low)")
-atrLen         = input.int(14,  "ATR Length", minval=1)
-atrMult        = input.float(0.10, "Breakout ATR Buffer Mult", step=0.05)
-confirmClose   = input.bool(true, "Require Bar Close Beyond Level")
-cooldownBars   = input.int(0, "Cooldown Bars Between Signals", minval=0)
+DONCHIAN_LEN = 20
+ATR_BUFFER = 0.10
+STOP_ATR_MULT = 2.0
 
-// ─────────────────────────────────────────────────────────────
-// Volume filter (optional)
-useVolFilter = input.bool(false, "Use Volume Filter")
-volLen       = input.int(30, "Volume SMA Length", minval=1)
-volMult      = input.float(1.2, "Volume Multiplier", step=0.1)
+# ── ارسال مع ازرار ──
+def send_telegram(msg, with_button=True):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "Markdown"}
+        if with_button:
+            payload["reply_markup"] = {
+                "inline_keyboard": [
+                    [{"text": "🚀 جيب 5 اسهم $2-$5 الحين", "callback_data": "get_5"}],
+                    [{"text": "📊 فحص سريع", "callback_data": "quick"}]
+                ]
+            }
+        requests.post(url, json=payload, timeout=20)
+    except Exception as e:
+        print(f"TG error {e}")
 
-// ─────────────────────────────────────────────────────────────
-// EMA trend filter (optional)
-useTrendFilter = input.bool(false, "Use EMA Trend Filter")
-emaLen         = input.int(200, "EMA Length", minval=1)
+def get_2_to_5():
+    try:
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers?apiKey={POLYGON_KEY}"
+        tickers = requests.get(url, timeout=20).json().get('tickers', [])
+        return [t['ticker'] for t in tickers if 2 <= (t.get('day',{}).get('c',0) or t.get('lastTrade',{}).get('p',0) or 0) <= 5][:100]
+    except:
+        return []
 
-// ─────────────────────────────────────────────────────────────
-// Stop settings (ATR-based)
-stopMode     = input.string("Fixed From Entry", "Stop Mode", options=["Fixed From Entry", "Chandelier"])
-stopAtrMult  = input.float(2.0, "Stop ATR Mult", step=0.25)
-stopLookback = input.int(22, "Chandelier Lookback", minval=1)
+def calc(ticker):
+    try:
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}"
+        data = requests.get(url, timeout=20).json().get('results',[])
+        if len(data) < 210: return None
+        closes = [x['c'] for x in data]
+        highs = [x['h'] for x in data]
+        vols = [x['v'] for x in data]
+        ema = sum(closes[-200:]) / 200
+        trs = [max(data[i]['h']-data[i]['l'], abs(data[i]['h']-data[i-1]['c']), abs(data[i]['l']-data[i-1]['c'])) for i in range(1,len(data))]
+        atr = sum(trs[-14:])/14
+        upper = max(highs[-21:-1])
+        last_close = closes[-1]
+        vol_sma = sum(vols[-31:-1])/30
+        if not (last_close > upper + atr*ATR_BUFFER and last_close > ema and vols[-1] > vol_sma*1.1 and vols[-1] > 400_000):
+            return None
+        return {
+            'sym': ticker, 'price': last_close, 'buy': upper+atr*ATR_BUFFER,
+            'stop': last_close - STOP_ATR_MULT*atr, 'tp1': last_close + atr*2, 'tp2': last_close + atr*4,
+            'vol': vols[-1], 'score': (last_close-upper)/atr
+        }
+    except:
+        return None
 
-// ─────────────────────────────────────────────────────────────
-// Donchian levels (IMPORTANT: previous bars only)
-srcHigh = useCloseLevels ? close : high
-srcLow  = useCloseLevels ? close : low
+def job(manual=False):
+    now = datetime.now(KSA)
+    print(f"SCAN $2-$5 manual={manual} {now}")
+    gainers = get_2_to_5()
+    picks = []
+    for s in gainers[:70]:
+        r = calc(s)
+        if r: picks.append(r)
+        time.sleep(0.2)
+    picks = sorted(picks, key=lambda x: x['score'], reverse=True)[:5]
 
-upper = ta.highest(srcHigh[1], len)
-lower = ta.lowest(srcLow[1], len)
+    if not picks:
+        send_telegram(f"🔍 *فحص {now.strftime('%H:%M')} KSA - $2-$5*\nفحصت {len(gainers)} سهم\nلا يوجد اختراق Donchian اليوم 😴")
+        return
 
-atr = ta.atr(atrLen)
-buf = atr * atrMult
+    msg = f"{'🔥 طلب فوري' if manual else '🚀 فحص تلقائي'} *TOP 5 - $2 الى $5 - {now.strftime('%H:%M')} KSA*\n"
+    msg += f"مؤشرك: Donchian20 + EMA200\n━━━━━━━━━━━━━━━\n\n"
+    for i,p in enumerate(picks,1):
+        msg += f"*{i}. {p['sym']}* ${p['price']:.2f}\n"
+        msg += f" 📍 شراء فوق: ${p['buy']:.2f}\n"
+        msg += f" 🛑 ستوب: ${p['stop']:.2f} | 🎯 {p['tp1']:.2f} / {p['tp2']:.2f}\n\n"
+    send_telegram(msg)
 
-// Filters
-volOk = not useVolFilter or (volume > ta.sma(volume, volLen) * volMult)
+# ── يستقبل ضغطات الازرار ──
+def telegram_listener():
+    offset = 0
+    print("Listener started...")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=30"
+            res = requests.get(url, timeout=35).json()
+            for upd in res.get('result', []):
+                offset = upd['update_id'] + 1
+                # ضغط زر
+                if 'callback_query' in upd:
+                    data = upd['callback_query']['data']
+                    # جواب للزر عشان يختفي التحميل
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                                  json={"callback_query_id": upd['callback_query']['id'], "text": "جاري الفحص..."}, timeout=10)
+                    if data == 'get_5':
+                        send_telegram("⏳ جاري فحص $2-$5...", with_button=False)
+                        job(manual=True)
+                    elif data == 'quick':
+                        job(manual=True)
+                # كتابة /stocks
+                if 'message' in upd and 'text' in upd['message']:
+                    txt = upd['message']['text'].lower()
+                    if '/stocks' in txt or 'جيب' in txt or 'اسهم' in txt:
+                        job(manual=True)
+        except Exception as e:
+            print(f"Listener error {e}")
+            time.sleep(5)
 
-ema = ta.ema(close, emaLen)
-trendOkLong  = not useTrendFilter or close > ema
-trendOkShort = not useTrendFilter or close < ema
+# ── التشغيل ──
+print("V14 Bot with Button Starting...")
+threading.Thread(target=telegram_listener, daemon=True).start()
 
-// Breakout conditions
-longBreak  = confirmClose ? (close > upper + buf) : (high > upper + buf)
-shortBreak = confirmClose ? (close < lower - buf) : (low < lower - buf)
+send_telegram(f"✅ *V14 اشتغل - مع زر $2-$5*\n⏰ تلقائي: 11ص | 4:30ع | 10م KSA\n👇 اضغطي الزر يجيب لك 5 اسهم الحين")
 
-// Cooldown to reduce repeated signals
-var int lastSignalBar = na
-canSignal = na(lastSignalBar) or (bar_index - lastSignalBar > cooldownBars)
+schedule.every().day.at("08:00").do(job)
+schedule.every().day.at("13:30").do(job)
+schedule.every().day.at("19:00").do(job)
 
-// Signals (respect toggles + filters)
-buySignal  = enableBuy  and canSignal and volOk and trendOkLong  and longBreak
-sellSignal = enableSell and canSignal and volOk and trendOkShort and shortBreak
+job()
 
-if buySignal or sellSignal
-    lastSignalBar := bar_index
-
-// ─────────────────────────────────────────────────────────────
-// Stop prices computed ONLY for the signal candle
-longStopFixed  = close - stopAtrMult * atr
-shortStopFixed = close + stopAtrMult * atr
-
-longStopChand  = ta.highest(high, stopLookback) - stopAtrMult * atr
-shortStopChand = ta.lowest(low, stopLookback)  + stopAtrMult * atr
-
-buyStopPrice  = stopMode == "Chandelier" ? longStopChand  : longStopFixed
-sellStopPrice = stopMode == "Chandelier" ? shortStopChand : shortStopFixed
-
-// Only show dots on the signal candle
-buyStopDot  = buySignal  ? buyStopPrice  : na
-sellStopDot = sellSignal ? sellStopPrice : na
-
-// ─────────────────────────────────────────────────────────────
-// Plotting
-plot(upper, "Upper (Prev Donchian)", color=color.new(color.green, 0), linewidth=2)
-plot(lower, "Lower (Prev Donchian)", color=color.new(color.red, 0), linewidth=2)
-plot(useTrendFilter ? ema : na, "EMA", color=color.new(color.orange, 0), linewidth=2)
-
-plotshape(buySignal,  title="BUY",  style=shape.labelup,   text="BUY",
-     color=color.new(color.green, 0), textcolor=color.white,
-     location=location.belowbar, size=size.tiny)
-
-plotshape(sellSignal, title="SELL", style=shape.labeldown, text="SELL",
-     color=color.new(color.red, 0), textcolor=color.white,
-     location=location.abovebar, size=size.tiny)
-
-// ✅ ATR Stop dots ONLY on the signal candle
-plot(buyStopDot,  title="BUY Stop Dot",  style=plot.style_circles, linewidth=4, color=color.new(color.yellow, 0))
-plot(sellStopDot, title="SELL Stop Dot", style=plot.style_circles, linewidth=4, color=color.new(color.yellow, 0))
-
-// Alerts
-alertcondition(buySignal,  "Breakout BUY",  "BUY breakout signal")
-alertcondition(sellSignal, "Breakout SELL", "SELL breakout signal")
+while True:
+    schedule.run_pending()
+    time.sleep(30)
